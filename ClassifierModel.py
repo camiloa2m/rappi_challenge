@@ -1,13 +1,18 @@
 from pickle import dump, load
-from sklearn.base import BaseEstimator, TransformerMixin
+
+import mlflow  # type: ignore
+import mlflow.sklearn  # type: ignore
 import pandas as pd
-from sklearn import tree
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
-from sklearn.pipeline import Pipeline
+from mlflow.models import infer_signature  # type: ignore
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
+
 
 # DecisionTreeClassifierTrainer
 class DTCTrainer(TransformerMixin, BaseEstimator):
@@ -18,9 +23,6 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         Args:
         - test_size: Proporción del conjunto de datos destinado a test.
         """
-        self.model = tree.DecisionTreeClassifier(
-            class_weight="balanced", random_state=42
-        )
         self.test_size = test_size
         self.numeric_features = [
             "TO_USER_DISTANCE",
@@ -29,6 +31,7 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
             "TIP",
         ]
         self.categorical_features = ["COUNTRY", "CITY"]
+        self.model = None
         self.preprocessor = None
 
     def get_data(self, dataset_path: str):
@@ -43,17 +46,17 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         """
         print("Leyendo datos y creando nuevas features...")
         df = pd.read_csv(dataset_path, sep=",", engine="python")
-        
+
         X = df.drop(columns=["ORDER_ID", "CREATED_AT", "SATURATION", "TAKEN"])
         y = df[["TAKEN"]]
-        
-        X["RATIO_DISTANCE"] = X["DISTANCE_TO_STORE"]/X["TO_USER_DISTANCE"]
+
+        X["RATIO_DISTANCE"] = X["DISTANCE_TO_STORE"] / X["TO_USER_DISTANCE"]
         self.numeric_features = self.numeric_features + ["RATIO_DISTANCE"]
-        
+
         # X = X.drop(columns=["DISTANCE_TO_STORE", "TO_USER_DISTANCE"])
         # self.numeric_features.remove("DISTANCE_TO_STORE")
         # self.numeric_features.remove("TO_USER_DISTANCE")
-        
+
         print(f"Dividiendo en conjunto de train y test (test_size={self.test_size})...")
         # Dividimos en conjunto de entrenamiento y validación
         X_train, X_test, y_train, y_test = train_test_split(
@@ -61,10 +64,9 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         )
 
         print("Datos cargados!")
-        
+
         return X_train, X_test, y_train, y_test
-    
-    
+
     def fit(self, X_train: pd.DataFrame):
         """
         Ajustando transformaciones para preprocesamiento de los datos.
@@ -104,15 +106,25 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         #     X_train.loc[
         #         X_train[col_str] > (Q3[col_str] + 1.5 * IQR[col_str]), col_str
         #     ] = upper_limit_to_impute[col_str]
-        
-        
+
         numeric_transformer = Pipeline(
-            steps=[("imputer_median", SimpleImputer(strategy="median")), ("scaler", MinMaxScaler())]
+            steps=[
+                ("imputer_median", SimpleImputer(strategy="median")),
+                ("scaler", MinMaxScaler()),
+            ]
         )
 
-        categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        categorical_transformer = OneHotEncoder(
+            handle_unknown="ignore", sparse_output=False
+        )
         categorical_transformer = Pipeline(
-            steps=[("imputer_mode", SimpleImputer(strategy="most_frequent")), ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]
+            steps=[
+                ("imputer_mode", SimpleImputer(strategy="most_frequent")),
+                (
+                    "encoder",
+                    OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                ),
+            ]
         )
 
         self.preprocessor = ColumnTransformer(
@@ -121,11 +133,11 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
                 ("cat", categorical_transformer, self.categorical_features),
             ]
         )
-        
+
         self.preprocessor.fit(X_train)
-        
+
         print("Peprocessor ajustando!")
-        
+
         return self
 
     def transform(self, X: pd.DataFrame):
@@ -139,29 +151,73 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         - X: Datos transformados.
         """
         print("Transformando datos...")
-        
+
         X = self.preprocessor.transform(X)
 
         print("Datos transformados!")
-        
+
         return X
 
-
-    def train(self, X_train, y_train):
+    def train(self, X_train, X_test, y_train, y_test, **args):
         """
-        Ajustando el modelo en el conjunto de entrenamiento.
+        Trains a DecisionTreeClassifier and logs parameters, metrics, and artifacts with MLflow.
 
         Args:
         - X_train: Características de entrenamiento.
+        - X_test: Características de testing.
         - y_train: Etiquetas de entrenamiento.
+        - y_train: Etiquetas de testing.
+        - args (dict): Argumentos para el DecisionTreeClassifier: criterion, max_depth, class_weight, random_state.
         """
-        print("Ajustando el modelo de clasificación...")
 
-        self.model.fit(X_train, y_train)
-        
-        print("Modelo ajustado!")
-        
-        return self
+        # Start an MLflow run; the "with" keyword ensures we'll close the run even if this cell crashes
+        with mlflow.start_run():
+            # Log hyperparameters
+            mlflow.log_param("criterion", args["criterion"])
+            mlflow.log_param("max_depth", args["max_depth"])
+            mlflow.log_param("class_weight", args["class_weight"])
+            mlflow.log_param("random_state", args["random_state"])
+
+            # Initialize the model
+            model = DecisionTreeClassifier(**args)
+            self.model = model
+
+            # Train model
+            self.model.fit(X_train, y_train)
+
+            # Evaluate model
+            accuracy_score, precision_score, recall_score, f1_score = self.evaluate(
+                X_test, y_test
+            )
+
+            # Print model metrics
+            print("Acurracy Score:", accuracy_score)
+            print("Precision Score:", precision_score)
+            print("Recall Score:", recall_score)
+            print("f1 Score:", f1_score)
+
+            # Log mlflow attributes for mlflow UI
+            mlflow.log_metric("acurracy", accuracy_score)
+            mlflow.log_metric("precision", precision_score)
+            mlflow.log_metric("recall", recall_score)
+            mlflow.log_metric("f1_score", f1_score)
+
+            # Signature
+            signature = infer_signature(X_test, y_test)
+
+            # Input_example
+            input_example = X_test[0, :]
+            input_example = input_example.reshape((-1,len(input_example)))
+
+            # Log the model as an artifact
+            mlflow.sklearn.log_model(
+                self.model,
+                "decision_tree_model",
+                signature=signature,
+                input_example=input_example,
+            )
+
+            return self
 
     def evaluate(self, X_test, y_test):
         """
@@ -175,8 +231,11 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         - accuracy, precision, recall, f1: accuracy_Score, precision_score, recall_score, f1_score
         """
         y_pred = self.model.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred,)
+
+        accuracy = accuracy_score(
+            y_test,
+            y_pred,
+        )
         precision = precision_score(y_test, y_pred, average="binary")
         recall = recall_score(y_test, y_pred, average="binary")
         f1 = f1_score(y_test, y_pred, average="binary")
@@ -197,6 +256,7 @@ class DTCTrainer(TransformerMixin, BaseEstimator):
         """
         # save the model
         dump(self.model, open(filepath_model, "wb"))
+        
         # save the preprocessor
         dump(self.preprocessor, open(filepath_preprocessor, "wb"))
 
@@ -238,14 +298,14 @@ class DTCModel(BaseEstimator):
         """
         df = pd.read_csv(dataset_path, sep=",", engine="python")
         X = df[self.numeric_features + self.categorical_features]
-        
-        X["RATIO_DISTANCE"] = X["DISTANCE_TO_STORE"]/X["TO_USER_DISTANCE"]
+
+        X["RATIO_DISTANCE"] = X["DISTANCE_TO_STORE"] / X["TO_USER_DISTANCE"]
         self.numeric_features = self.numeric_features + ["RATIO_DISTANCE"]
-        
+
         # X = X.drop(columns=["DISTANCE_TO_STORE", "TO_USER_DISTANCE"])
         # self.numeric_features.remove("DISTANCE_TO_STORE")
         # self.numeric_features.remove("TO_USER_DISTANCE")
-        
+
         return X
 
     def transform(self, X: pd.DataFrame):
@@ -259,11 +319,11 @@ class DTCModel(BaseEstimator):
         - X: Datos procesados.
         """
         print("Transformando datos...")
-        
+
         X = self.preprocessor.transform(X)
 
         print("Datos transformados!")
-        
+
         return X
 
     def predict(self, X):
